@@ -74,7 +74,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 def log(msg: str):
     """לוג עם timestamp"""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    # חשוב ל-Render/containers: stdout הוא לא TTY ולכן Python עלול לא לעשות flush מיידי.
+    # flush=True מבטיח שתראה לוגים בזמן אמת.
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def make_fingerprint(subject: str, snippet: str) -> str:
@@ -423,10 +425,13 @@ def main_loop():
 
     while True:
         try:
+            log("🔎 בודק מיילים חדשים מפייסבוק...")
             mail_conn, emails = fetch_facebook_emails()
 
             if emails:
                 log(f"📬 נמצאו {len(emails)} מיילים חדשים")
+            else:
+                log("📭 אין מיילים חדשים (UNSEEN) כרגע")
 
             alerts_sent = 0
             for email_data in emails:
