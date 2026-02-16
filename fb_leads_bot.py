@@ -14,7 +14,8 @@ Facebook Leads Finder Bot - v0.2
 - פלט AI בפורמט JSON מובנה (לא בדיקת "כן" בטקסט חופשי)
 - סף confidence >= 80 לשליחת התראה
 - Fingerprint dedup למניעת כפילויות (hash של subject+snippet)
-- סימון Seen רק אחרי עיבוד מוצלח
+- שימוש ב-IMAP UID (מזהה יציב) במקום IDs רציפים
+- סימון Seen גם במקרה של כשל AI/כשל עיבוד (כדי למנוע לולאה אינסופית)
 - הסרת מידע אישי (טלפונים/מיילים) לפני שליחה ל-AI
 - משתני סביבה לכל הסודות
 - Error handling מלא עם retry logic
@@ -49,6 +50,7 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))  # שניות בין ב
 CONFIDENCE_THRESHOLD = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 MAX_POST_LENGTH = 2000  # חיתוך טקסט לפני שליחה ל-AI
+ERROR_MAILBOX = os.getenv("ERROR_MAILBOX", "")  # לדוגמה: "Error" / "Errors" / "FB Errors"
 
 # מילות מפתח לסינון ראשוני (חוסך עלויות AI)
 TRIGGER_KEYWORDS = [
@@ -171,26 +173,110 @@ def extract_email_body(msg) -> str:
     return "\n".join(lines)
 
 
+def _imap_uid_store(mail_conn, uid: str, command: str, flags: str) -> bool:
+    """עוזר: STORE לפי UID עם טיפול בשגיאות"""
+    try:
+        status, _ = mail_conn.uid("STORE", uid, command, flags)
+        return status == "OK"
+    except Exception as e:
+        log(f"⚠️ שגיאת IMAP UID STORE (uid={uid}): {e}")
+        return False
+
+
+def mark_seen(mail_conn, uid: str) -> bool:
+    """מסמן מייל כ-Seen לפי UID"""
+    return _imap_uid_store(mail_conn, uid, "+FLAGS", "\\Seen")
+
+
+def flag_error(mail_conn, uid: str) -> bool:
+    """מסמן מייל כ-Flagged (עוזר למציאת כשלונות)"""
+    return _imap_uid_store(mail_conn, uid, "+FLAGS", "\\Flagged")
+
+
+def move_to_mailbox(mail_conn, uid: str, mailbox: str) -> bool:
+    """
+    מעביר מייל לתיבה אחרת לפי UID (COPY + \\Deleted + EXPUNGE).
+    אם נכשל, נחזיר False כדי שנוכל לפחות לסמן Seen.
+    """
+    if not mailbox:
+        return False
+    try:
+        # צריך לצטט שמות תיבות (במיוחד עם רווחים). נשתמש במנגנון הציטוט של imaplib אם קיים.
+        try:
+            mb = mail_conn._quote(mailbox)
+        except Exception:
+            mb = mailbox
+            if (" " in mb) and not (mb.startswith('"') and mb.endswith('"')):
+                mb = f"\"{mb}\""
+        # ננסה ליצור את התיבה אם לא קיימת (חלק מהשרתים יחזירו NO אם קיימת)
+        try:
+            mail_conn.create(mb)
+        except Exception:
+            pass
+
+        status, _ = mail_conn.uid("COPY", uid, mb)
+        if status != "OK":
+            return False
+        if not _imap_uid_store(mail_conn, uid, "+FLAGS", "\\Deleted"):
+            return False
+        try:
+            mail_conn.expunge()
+        except Exception:
+            # גם אם expunge נכשל, לפחות סימנו למחיקה
+            pass
+        return True
+    except Exception as e:
+        log(f"⚠️ שגיאת העברה לתיבה '{mailbox}' (uid={uid}): {e}")
+        return False
+
+
+def handle_processing_failure(mail_conn, uid: str, subject: str, reason: str):
+    """מבטיח שהמייל לא ייתקע כ-UNSEEN במקרה של כשל."""
+    subj = (subject or "")[:60]
+    log(f"⚠️ כשל בעיבוד (uid={uid}, subject='{subj}'): {reason}")
+    # נסמן כ-Flagged כדי שיהיה קל למצוא ידנית
+    flag_error(mail_conn, uid)
+    # אם הוגדרה תיבת שגיאות - נעביר אליה; אחרת נסמן Seen
+    if ERROR_MAILBOX and move_to_mailbox(mail_conn, uid, ERROR_MAILBOX):
+        return
+    mark_seen(mail_conn, uid)
+
+
 def fetch_facebook_emails():
     """מתחבר ל-Outlook ומחזיר רשימת מיילים חדשים מפייסבוק"""
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("inbox")
 
-    status, messages = mail.search(None, '(UNSEEN FROM "facebookmail.com")')
-    email_ids = messages[0].split() if messages[0] else []
+    # משתמשים ב-UID כדי לקבל מזהים יציבים (IMAP message sequence IDs עלולים להשתנות)
+    status, data = mail.uid("SEARCH", None, '(UNSEEN FROM "facebookmail.com")')
+    uid_list = data[0].split() if (status == "OK" and data and data[0]) else []
 
     results = []
-    for e_id in email_ids:
-        _, msg_data = mail.fetch(e_id, "(RFC822)")
-        msg = email.message_from_bytes(msg_data[0][1])
+    for uid_bytes in uid_list:
+        uid = uid_bytes.decode(errors="ignore")
+        status, msg_data = mail.uid("FETCH", uid, "(BODY.PEEK[])")
+        if status != "OK" or not msg_data:
+            log(f"⚠️ FETCH נכשל (uid={uid})")
+            continue
+
+        raw_bytes = None
+        for item in msg_data:
+            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
+                raw_bytes = item[1]
+                break
+        if not raw_bytes:
+            log(f"⚠️ FETCH החזיר תוכן ריק (uid={uid})")
+            continue
+
+        msg = email.message_from_bytes(raw_bytes)
 
         subject = decode_subject(msg)
         body = extract_email_body(msg)
         full_text = f"{subject}\n\n{body}" if subject else body
 
         results.append({
-            "email_id": e_id,
+            "uid": uid,
             "subject": subject,
             "body": body,
             "full_text": full_text,
@@ -365,7 +451,7 @@ def validate_config():
 
 def process_single_email(mail_conn, email_data: dict) -> bool:
     """מעבד מייל בודד. מחזיר True אם נשלחה התראה"""
-    e_id = email_data["email_id"]
+    uid = email_data["uid"]
     subject = email_data["subject"]
     full_text = email_data["full_text"]
 
@@ -373,13 +459,13 @@ def process_single_email(mail_conn, email_data: dict) -> bool:
     fp = make_fingerprint(subject, full_text)
     if is_duplicate(fp):
         log(f"⏭️ דילוג - כפילות: {subject[:50]}")
-        mail_conn.store(e_id, '+FLAGS', '\\Seen')
+        mark_seen(mail_conn, uid)
         return False
 
     # סינון מהיר לפני AI
     if not quick_keyword_filter(full_text):
         log(f"⏭️ דילוג - אין מילות מפתח: {subject[:50]}")
-        mail_conn.store(e_id, '+FLAGS', '\\Seen')
+        mark_seen(mail_conn, uid)
         return False
 
     # ניתוח AI
@@ -387,8 +473,8 @@ def process_single_email(mail_conn, email_data: dict) -> bool:
     analysis = analyze_with_ai(full_text)
 
     if analysis is None:
-        log("⚠️ AI לא החזיר תוצאה - נדלג (המייל יישאר UNSEEN)")
-        return False  # לא מסמנים כ-Seen, ננסה שוב בסבב הבא
+        handle_processing_failure(mail_conn, uid, subject, "AI לא החזיר JSON תקין/נכשל")
+        return False
 
     is_relevant = analysis.get("is_relevant", False)
     confidence = int(analysis.get("confidence", 0))
@@ -397,12 +483,12 @@ def process_single_email(mail_conn, email_data: dict) -> bool:
         alert_msg = format_alert(analysis, email_data["body"])
         send_telegram(alert_msg)
         log(f"✅ התראה נשלחה! (confidence: {confidence}%)")
-        mail_conn.store(e_id, '+FLAGS', '\\Seen')
+        mark_seen(mail_conn, uid)
         return True
     else:
         reason = analysis.get("reason", "")
         log(f"⏭️ לא רלוונטי (confidence: {confidence}%): {reason[:80]}")
-        mail_conn.store(e_id, '+FLAGS', '\\Seen')
+        mark_seen(mail_conn, uid)
         return False
 
 
@@ -434,7 +520,18 @@ def main_loop():
                     if process_single_email(mail_conn, email_data):
                         alerts_sent += 1
                 except Exception as e:
-                    log(f"⚠️ שגיאה בעיבוד מייל: {e}")
+                    # לא משאירים את המייל כ-UNSEEN כדי לא להיתקע על אותו מייל שוב ושוב
+                    try:
+                        uid = email_data.get("uid")
+                        if uid:
+                            handle_processing_failure(
+                                mail_conn,
+                                uid,
+                                email_data.get("subject", ""),
+                                f"Exception: {e}",
+                            )
+                    except Exception:
+                        pass
                     continue
 
             if emails:
