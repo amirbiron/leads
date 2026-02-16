@@ -1,7 +1,7 @@
 """
 Facebook Leads Finder Bot - v0.2
 ================================
-זרימה: Facebook Notifications → Gmail → AI Analysis → Telegram Alert
+זרימה: Facebook Notifications → Outlook → AI Analysis → Telegram Alert
 
 מבוסס על ארכיטקטורה מינימלית:
 פייסבוק שולח התראות למייל → הבוט קורא מיילים → מסנן עם מילות מפתח →
@@ -106,7 +106,7 @@ def strip_pii(text: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# שלב 1: קריאת מיילים מ-Gmail
+# שלב 1: קריאת מיילים מ-Outlook
 # ──────────────────────────────────────────────
 
 def decode_subject(msg) -> str:
@@ -172,7 +172,7 @@ def extract_email_body(msg) -> str:
 
 
 def fetch_facebook_emails():
-    """מתחבר ל-Gmail ומחזיר רשימת מיילים חדשים מפייסבוק"""
+    """מתחבר ל-Outlook ומחזיר רשימת מיילים חדשים מפייסבוק"""
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("inbox")
