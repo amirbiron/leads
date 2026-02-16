@@ -39,7 +39,26 @@ from openai import OpenAI
 # ──────────────────────────────────────────────
 IMAP_SERVER = os.getenv("IMAP_SERVER", "outlook.office365.com")
 EMAIL_USER = os.getenv("EMAIL_USER", "")
-EMAIL_PASS = os.getenv("EMAIL_PASS", "")  # סיסמת אפליקציה של Outlook
+# Basic auth password (עובד ב-Gmail עם App Password; ב-Outlook לרוב חסום)
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+
+# IMAP auth method: basic | xoauth2 | auto
+# - basic: משתמש ב-EMAIL_PASS
+# - xoauth2: משתמש ב-refresh token של Microsoft (ל-Outlook/Office365)
+# - auto: אם יש MS_REFRESH_TOKEN+MS_CLIENT_ID ינסה xoauth2, אחרת basic
+IMAP_AUTH_METHOD = os.getenv("IMAP_AUTH_METHOD", "auto").lower().strip()
+
+# Microsoft OAuth2 (ל-Outlook/Office365 IMAP via XOAUTH2)
+# ברוב המקרים עם חשבון Outlook.com אישי: MS_TENANT="consumers"
+MS_TENANT = os.getenv("MS_TENANT", "consumers").strip()
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "").strip()
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "").strip()
+MS_REFRESH_TOKEN = os.getenv("MS_REFRESH_TOKEN", "").strip()
+# Scope ברירת מחדל ל-IMAP. ניתן להוסיף גם SMTP.Send אם תרצה לשלוח מיילים בעתיד.
+MS_SCOPE = os.getenv(
+    "MS_SCOPE",
+    "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+).strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -77,6 +96,66 @@ def log(msg: str):
     # חשוב ל-Render/containers: stdout הוא לא TTY ולכן Python עלול לא לעשות flush מיידי.
     # flush=True מבטיח שתראה לוגים בזמן אמת.
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def _ms_token_endpoint() -> str:
+    return f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
+
+
+def get_ms_access_token() -> str | None:
+    """מחלץ access token מ-Microsoft בעזרת refresh token (OAuth2 v2)."""
+    if not (MS_CLIENT_ID and MS_REFRESH_TOKEN):
+        return None
+
+    data = {
+        "client_id": MS_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": MS_REFRESH_TOKEN,
+        "scope": MS_SCOPE,
+    }
+    if MS_CLIENT_SECRET:
+        data["client_secret"] = MS_CLIENT_SECRET
+
+    try:
+        resp = requests.post(_ms_token_endpoint(), data=data, timeout=20)
+        if not resp.ok:
+            # ניסיון להדפיס שגיאה קריאה (אם יש JSON)
+            try:
+                err = resp.json()
+            except Exception:
+                err = resp.text
+            log(f"⚠️ OAuth2 token נכשל ({resp.status_code}): {err}")
+            return None
+        payload = resp.json()
+        return payload.get("access_token")
+    except Exception as e:
+        log(f"⚠️ שגיאת רשת בקבלת OAuth2 token: {e}")
+        return None
+
+
+def connect_imap():
+    """יוצר חיבור IMAP מחובר (basic או XOAUTH2)."""
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+
+    method = IMAP_AUTH_METHOD
+    if method not in ("basic", "xoauth2", "oauth2", "auto"):
+        method = "auto"
+
+    want_oauth = method in ("xoauth2", "oauth2") or (
+        method == "auto" and MS_CLIENT_ID and MS_REFRESH_TOKEN
+    )
+
+    if want_oauth:
+        token = get_ms_access_token()
+        if not token:
+            raise imaplib.IMAP4.error("OAuth2 token acquisition failed (missing/invalid token)")
+
+        auth_string = f"user={EMAIL_USER}\x01auth=Bearer {token}\x01\x01".encode("utf-8")
+        mail.authenticate("XOAUTH2", lambda _: auth_string)
+    else:
+        mail.login(EMAIL_USER, EMAIL_PASS)
+
+    return mail
 
 
 def make_fingerprint(subject: str, snippet: str) -> str:
@@ -175,8 +254,7 @@ def extract_email_body(msg) -> str:
 
 def fetch_facebook_emails():
     """מתחבר ל-Gmail ומחזיר רשימת מיילים חדשים מפייסבוק"""
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-    mail.login(EMAIL_USER, EMAIL_PASS)
+    mail = connect_imap()
     mail.select("inbox")
 
     status, messages = mail.search(None, '(UNSEEN FROM "facebookmail.com")')
@@ -349,8 +427,18 @@ def validate_config():
     missing = []
     if not EMAIL_USER:
         missing.append("EMAIL_USER")
-    if not EMAIL_PASS:
-        missing.append("EMAIL_PASS")
+    # IMAP auth prerequisites
+    if IMAP_AUTH_METHOD in ("xoauth2", "oauth2") or (
+        IMAP_AUTH_METHOD == "auto" and MS_CLIENT_ID and MS_REFRESH_TOKEN
+    ):
+        if not MS_CLIENT_ID:
+            missing.append("MS_CLIENT_ID")
+        if not MS_REFRESH_TOKEN:
+            missing.append("MS_REFRESH_TOKEN")
+        # MS_CLIENT_SECRET תלוי בסוג האפליקציה, לכן לא מחייבים.
+    else:
+        if not EMAIL_PASS:
+            missing.append("EMAIL_PASS")
     if not OPENAI_API_KEY:
         missing.append("OPENAI_API_KEY")
     if not TELEGRAM_BOT_TOKEN:
@@ -455,7 +543,11 @@ def main_loop():
 
         except imaplib.IMAP4.error as e:
             consecutive_errors += 1
-            log(f"⚠️ שגיאת IMAP ({consecutive_errors}): {e}")
+            err_txt = str(e)
+            log(f"⚠️ שגיאת IMAP ({consecutive_errors}): {err_txt}")
+            if "BasicAuthBlocked" in err_txt or "BasicAuth" in err_txt:
+                log("ℹ️ נראה ש-Outlook חוסם IMAP עם סיסמה (Basic Auth).")
+                log("ℹ️ פתרון: הגדר IMAP_AUTH_METHOD=xoauth2 והוסף MS_CLIENT_ID + MS_REFRESH_TOKEN (ואופציונלי MS_CLIENT_SECRET) ב-Render Secrets.")
             if consecutive_errors >= 5:
                 log("❌ יותר מדי שגיאות IMAP ברצף - ממתין 10 דקות")
                 time.sleep(600)
