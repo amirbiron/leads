@@ -37,9 +37,9 @@ from openai import OpenAI
 # ──────────────────────────────────────────────
 # קונפיגורציה - הכל דרך משתני סביבה
 # ──────────────────────────────────────────────
-IMAP_SERVER = "imap.gmail.com"
+IMAP_SERVER = os.getenv("IMAP_SERVER", "outlook.office365.com")
 EMAIL_USER = os.getenv("EMAIL_USER", "")
-EMAIL_PASS = os.getenv("EMAIL_PASS", "")  # סיסמת אפליקציה של Gmail, לא הסיסמה הרגילה
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")  # סיסמת אפליקציה של Outlook
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
