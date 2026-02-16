@@ -201,9 +201,13 @@ def move_to_mailbox(mail_conn, uid: str, mailbox: str) -> bool:
     if not mailbox:
         return False
     try:
-        mb = mailbox
-        if (" " in mb) and not (mb.startswith('"') and mb.endswith('"')):
-            mb = f"\"{mb}\""
+        # צריך לצטט שמות תיבות (במיוחד עם רווחים). נשתמש במנגנון הציטוט של imaplib אם קיים.
+        try:
+            mb = mail_conn._quote(mailbox)
+        except Exception:
+            mb = mailbox
+            if (" " in mb) and not (mb.startswith('"') and mb.endswith('"')):
+                mb = f"\"{mb}\""
         # ננסה ליצור את התיבה אם לא קיימת (חלק מהשרתים יחזירו NO אם קיימת)
         try:
             mail_conn.create(mb)
