@@ -55,10 +55,10 @@ TRIGGER_KEYWORDS = [
     # עברית
     "בוט", "אוטומציה", "סקריפט", "מתכנת", "פיתוח", "מחפש מפתח",
     "דרוש מפתח", "צריך עזרה", "מישהו יכול", "לבנות מערכת",
-    "זאפייר", "אינטגרציה", "אוטומטי",
+    "טלגרם", "אינטגרציה", "אוטומטי", "ווטסאפ", "בהתנדבות"
     # אנגלית
     "bot", "telegram", "whatsapp", "automation", "python", "script",
-    "developer", "zapier", "make", "integromat", "n8n", "api",
+    "developer", "zapier", "make", "integromat", "api",
 ]
 
 # Fingerprints - למניעת כפילויות (בזיכרון, מספיק להובי)
