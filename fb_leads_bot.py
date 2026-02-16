@@ -201,13 +201,16 @@ def move_to_mailbox(mail_conn, uid: str, mailbox: str) -> bool:
     if not mailbox:
         return False
     try:
+        mb = mailbox
+        if (" " in mb) and not (mb.startswith('"') and mb.endswith('"')):
+            mb = f"\"{mb}\""
         # ננסה ליצור את התיבה אם לא קיימת (חלק מהשרתים יחזירו NO אם קיימת)
         try:
-            mail_conn.create(mailbox)
+            mail_conn.create(mb)
         except Exception:
             pass
 
-        status, _ = mail_conn.uid("COPY", uid, mailbox)
+        status, _ = mail_conn.uid("COPY", uid, mb)
         if status != "OK":
             return False
         if not _imap_uid_store(mail_conn, uid, "+FLAGS", "\\Deleted"):
@@ -515,12 +518,14 @@ def main_loop():
                 except Exception as e:
                     # לא משאירים את המייל כ-UNSEEN כדי לא להיתקע על אותו מייל שוב ושוב
                     try:
-                        handle_processing_failure(
-                            mail_conn,
-                            email_data.get("uid", ""),
-                            email_data.get("subject", ""),
-                            f"Exception: {e}",
-                        )
+                        uid = email_data.get("uid")
+                        if uid:
+                            handle_processing_failure(
+                                mail_conn,
+                                uid,
+                                email_data.get("subject", ""),
+                                f"Exception: {e}",
+                            )
                     except Exception:
                         pass
                     continue
