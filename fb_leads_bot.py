@@ -135,10 +135,21 @@ TRIGGER_KEYWORDS = [
     # עברית
     "בוט", "אוטומציה", "סקריפט", "מתכנת", "פיתוח", "מחפש מפתח",
     "דרוש מפתח", "צריך עזרה", "מישהו יכול", "לבנות מערכת",
-    "טלגרם", "אינטגרציה", "אוטומטי", "ווטסאפ", "בהתנדבות"
+    "טלגרם", "אינטגרציה", "אוטומטי", "ווטסאפ", "בהתנדבות",
     # אנגלית
     "bot", "telegram", "whatsapp", "automation", "python", "script",
     "developer", "zapier", "make", "integromat", "api",
+]
+
+# מילות מפתח לסינון הודעות מערכת של פייסבוק (Negative keywords)
+IGNORE_KEYWORDS = [
+    "הצטרפת לקבוצה",
+    "התחברת הרגע",
+    "התראת אבטחה",
+    "security alert",
+    "new login",
+    "reset your password",
+    "ברוך הבא לקבוצה",
 ]
 
 # Fingerprints - למניעת כפילויות (בזיכרון, מספיק להובי)
@@ -444,6 +455,12 @@ def fetch_facebook_emails():
 def quick_keyword_filter(text: str) -> bool:
     """בדיקה מהירה אם יש מילות טריגר - חוסך קריאות AI"""
     text_lower = text.lower()
+
+    # סינון שורשי: קודם כל בודקים אם זו הודעת מערכת/זבל. אם כן - חותכים מיד.
+    if any(bad_kw in text_lower for bad_kw in IGNORE_KEYWORDS):
+        return False
+
+    # אם זה לא זבל, נבדוק אם יש מילות מפתח רלוונטיות
     return any(kw in text_lower for kw in TRIGGER_KEYWORDS)
 
 
