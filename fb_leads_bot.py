@@ -1,7 +1,7 @@
 """
 Facebook Leads Finder Bot - v0.2
 ================================
-זרימה: Facebook Notifications → Outlook → AI Analysis → Telegram Alert
+זרימה: Facebook Notifications → Email (Gmail/Outlook) → AI Analysis → Telegram Alert
 
 מבוסס על ארכיטקטורה מינימלית:
 פייסבוק שולח התראות למייל → הבוט קורא מיילים → מסנן עם מילות מפתח →
@@ -38,10 +38,69 @@ from openai import OpenAI
 # ──────────────────────────────────────────────
 # קונפיגורציה - הכל דרך משתני סביבה
 # ──────────────────────────────────────────────
-IMAP_SERVER = os.getenv("IMAP_SERVER", "outlook.office365.com")
-EMAIL_USER = os.getenv("EMAIL_USER", "")
+# IMAP endpoint
+# אם לא מגדירים IMAP_SERVER, ננסה להסיק לפי הדומיין של EMAIL_USER (gmail/outlook).
+EMAIL_USER = os.getenv("EMAIL_USER", "").strip()
+IMAP_PROVIDER = os.getenv("IMAP_PROVIDER", "auto").lower().strip()  # auto | gmail | outlook
+_IMAP_SERVER_ENV = os.getenv("IMAP_SERVER", "").strip()
+_IMAP_PORT_ENV = os.getenv("IMAP_PORT", "").strip()
+
+
+def _guess_provider_from_email(addr: str) -> str | None:
+    if "@" not in (addr or ""):
+        return None
+    domain = addr.split("@", 1)[1].lower().strip()
+    if domain in ("gmail.com", "googlemail.com"):
+        return "gmail"
+    if domain in ("outlook.com", "hotmail.com", "live.com", "msn.com"):
+        return "outlook"
+    return None
+
+
+def _guess_provider_from_host(host: str) -> str | None:
+    h = (host or "").lower()
+    if "gmail" in h:
+        return "gmail"
+    if "office365" in h or "outlook" in h:
+        return "outlook"
+    return None
+
+
+def _resolve_imap_endpoint() -> tuple[str, int, str]:
+    provider_pref = IMAP_PROVIDER if IMAP_PROVIDER else "auto"
+    provider_email = _guess_provider_from_email(EMAIL_USER)
+    provider_host = _guess_provider_from_host(_IMAP_SERVER_ENV)
+
+    # Resolve host
+    host = _IMAP_SERVER_ENV
+    if not host:
+        # Prefer explicit provider, otherwise infer from email.
+        inferred = provider_email
+        if provider_pref == "gmail" or inferred == "gmail":
+            host = "imap.gmail.com"
+        elif provider_pref == "outlook" or inferred == "outlook":
+            host = "outlook.office365.com"
+        else:
+            # Backward-compatible fallback
+            host = "outlook.office365.com"
+
+    # Resolve port (default 993 for both Gmail/Outlook IMAP SSL)
+    try:
+        port = int(_IMAP_PORT_ENV) if _IMAP_PORT_ENV else 0
+    except Exception:
+        port = 0
+    if not port:
+        port = 993
+
+    # Resolve provider label (used for auth decisions + better logs)
+    provider = _guess_provider_from_host(host) or provider_host or provider_email or "unknown"
+    return host, port, provider
+
+
+IMAP_SERVER, IMAP_PORT, IMAP_PROVIDER_RESOLVED = _resolve_imap_endpoint()
+
 # Basic auth password (עובד ב-Gmail עם App Password; ב-Outlook לרוב חסום)
-EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "").strip()
 
 # IMAP auth method: basic | xoauth2 | auto
 # - basic: משתמש ב-EMAIL_PASS
@@ -137,15 +196,27 @@ def get_ms_access_token() -> str | None:
 
 def connect_imap():
     """יוצר חיבור IMAP מחובר (basic או XOAUTH2)."""
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
 
     method = IMAP_AUTH_METHOD
     if method not in ("basic", "xoauth2", "oauth2", "auto"):
         method = "auto"
 
-    want_oauth = method in ("xoauth2", "oauth2") or (
-        method == "auto" and MS_CLIENT_ID and MS_REFRESH_TOKEN
-    )
+    ms_oauth_supported = IMAP_PROVIDER_RESOLVED in ("outlook", "office365", "microsoft")
+
+    if method in ("xoauth2", "oauth2"):
+        if not ms_oauth_supported:
+            raise imaplib.IMAP4.error(
+                "XOAUTH2 is only implemented for Microsoft (Outlook/Office365) in this bot. "
+                "For Gmail use IMAP_AUTH_METHOD=basic with an App Password, and IMAP_SERVER=imap.gmail.com."
+            )
+        want_oauth = True
+    elif method == "auto":
+        want_oauth = ms_oauth_supported and MS_CLIENT_ID and MS_REFRESH_TOKEN
+    else:
+        want_oauth = False
+
+    log(f"🔌 IMAP connect: {IMAP_SERVER}:{IMAP_PORT} (provider={IMAP_PROVIDER_RESOLVED}, auth={'xoauth2' if want_oauth else 'basic'})")
 
     if want_oauth:
         token = get_ms_access_token()
@@ -515,9 +586,18 @@ def validate_config():
     if not EMAIL_USER:
         missing.append("EMAIL_USER")
     # IMAP auth prerequisites
-    if IMAP_AUTH_METHOD in ("xoauth2", "oauth2") or (
-        IMAP_AUTH_METHOD == "auto" and MS_CLIENT_ID and MS_REFRESH_TOKEN
-    ):
+    ms_oauth_supported = IMAP_PROVIDER_RESOLVED in ("outlook", "office365", "microsoft")
+
+    if IMAP_AUTH_METHOD in ("xoauth2", "oauth2") and not ms_oauth_supported:
+        log("❌ IMAP_AUTH_METHOD=xoauth2 נתמך כאן רק עבור Outlook/Office365 (Microsoft OAuth).")
+        log("ℹ️ עבור Gmail: הגדר IMAP_SERVER=imap.gmail.com, IMAP_AUTH_METHOD=basic והשתמש ב-EMAIL_PASS כסיסמת אפליקציה (App Password).")
+        return False
+
+    want_oauth = (IMAP_AUTH_METHOD in ("xoauth2", "oauth2")) or (
+        IMAP_AUTH_METHOD == "auto" and ms_oauth_supported and MS_CLIENT_ID and MS_REFRESH_TOKEN
+    )
+
+    if want_oauth:
         if not MS_CLIENT_ID:
             missing.append("MS_CLIENT_ID")
         if not MS_REFRESH_TOKEN:
@@ -590,6 +670,7 @@ def main_loop():
 
     log("🚀 Facebook Leads Bot התחיל לרוץ!")
     log(f"📧 מייל: {EMAIL_USER}")
+    log(f"📨 IMAP: {IMAP_SERVER}:{IMAP_PORT} (provider={IMAP_PROVIDER_RESOLVED}, IMAP_AUTH_METHOD={IMAP_AUTH_METHOD})")
     log(f"⏱️ בדיקה כל {CHECK_INTERVAL} שניות")
     log(f"🎚️ סף confidence: {CONFIDENCE_THRESHOLD}%")
     log(f"🤖 מודל: {AI_MODEL}")
@@ -644,8 +725,12 @@ def main_loop():
             err_txt = str(e)
             log(f"⚠️ שגיאת IMAP ({consecutive_errors}): {err_txt}")
             if "BasicAuthBlocked" in err_txt or "BasicAuth" in err_txt:
-                log("ℹ️ נראה ש-Outlook חוסם IMAP עם סיסמה (Basic Auth).")
-                log("ℹ️ פתרון: הגדר IMAP_AUTH_METHOD=xoauth2 והוסף MS_CLIENT_ID + MS_REFRESH_TOKEN (ואופציונלי MS_CLIENT_SECRET) ב-Render Secrets.")
+                if IMAP_PROVIDER_RESOLVED == "outlook":
+                    log("ℹ️ נראה ש-Outlook חוסם IMAP עם סיסמה (Basic Auth).")
+                    log("ℹ️ פתרון: הגדר IMAP_AUTH_METHOD=xoauth2 והוסף MS_CLIENT_ID + MS_REFRESH_TOKEN (ואופציונלי MS_CLIENT_SECRET) ב-Render Secrets.")
+                    log("ℹ️ אם התכוונת ל-Gmail: הגדר IMAP_SERVER=imap.gmail.com ו-IMAP_AUTH_METHOD=basic עם App Password.")
+                else:
+                    log("ℹ️ השרת מחזיר BasicAuthBlocked. בדוק שאתה מתחבר לשרת הנכון (ל-Gmail: IMAP_SERVER=imap.gmail.com, IMAP_AUTH_METHOD=basic עם App Password).")
             if consecutive_errors >= 5:
                 log("❌ יותר מדי שגיאות IMAP ברצף - ממתין 10 דקות")
                 time.sleep(600)
