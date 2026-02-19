@@ -153,7 +153,8 @@ IGNORE_KEYWORDS = [
 ]
 
 # Fingerprints - למניעת כפילויות (בזיכרון, מספיק להובי)
-seen_fingerprints: set = set()
+# Fingerprints - למניעת כפילויות (שומר על סדר ההכנסה)
+seen_fingerprints: dict[str, bool] = {}
 MAX_FINGERPRINTS = 5000  # שומר את האחרונים בלבד
 
 # ──────────────────────────────────────────────
@@ -253,10 +254,13 @@ def is_duplicate(fingerprint: str) -> bool:
     global seen_fingerprints
     if fingerprint in seen_fingerprints:
         return True
-    seen_fingerprints.add(fingerprint)
-    # ניקוי אם הרשימה גדלה מדי
+    seen_fingerprints[fingerprint] = True
+
+    # ניקוי הישנים ביותר אם הרשימה גדלה מדי
     if len(seen_fingerprints) > MAX_FINGERPRINTS:
-        seen_fingerprints = set(list(seen_fingerprints)[-MAX_FINGERPRINTS // 2:])
+        old_keys = list(seen_fingerprints.keys())[: MAX_FINGERPRINTS // 2]
+        for k in old_keys:
+            del seen_fingerprints[k]
     return False
 
 
@@ -333,7 +337,24 @@ def extract_email_body(msg) -> str:
 
     # ניקוי רווחים ושורות ריקות
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    final_text = "\n".join(lines)
+
+    # חיתוך ה-Footer של פייסבוק (חיסכון בטוקנים והפחתת "רעש" ל-AI)
+    cutoff_phrases = [
+        "View on Facebook",
+        "Reply to this email",
+        "הצג בפייסבוק",
+        "כדי להפסיק לקבל התראות",
+    ]
+    earliest_cut = None
+    for phrase in cutoff_phrases:
+        idx = final_text.find(phrase)
+        if idx != -1:
+            earliest_cut = idx if earliest_cut is None else min(earliest_cut, idx)
+    if earliest_cut is not None:
+        final_text = final_text[:earliest_cut]
+
+    return final_text.strip()
 
 
 def _imap_uid_store(mail_conn, uid: str, command: str, flags: str) -> bool:
@@ -452,16 +473,17 @@ def fetch_facebook_emails():
 # שלב 2: סינון מהיר (לפני AI)
 # ──────────────────────────────────────────────
 
-def quick_keyword_filter(text: str) -> bool:
-    """בדיקה מהירה אם יש מילות טריגר - חוסך קריאות AI"""
-    text_lower = text.lower()
+def quick_keyword_filter(text: str) -> str:
+    """מחזיר 'pass' אם תקין, או מחרוזת עם סיבת הפסילה."""
+    text_lower = (text or "").lower()
 
-    # סינון שורשי: קודם כל בודקים אם זו הודעת מערכת/זבל. אם כן - חותכים מיד.
     if any(bad_kw in text_lower for bad_kw in IGNORE_KEYWORDS):
-        return False
+        return "הודעת מערכת/זבל"
 
-    # אם זה לא זבל, נבדוק אם יש מילות מפתח רלוונטיות
-    return any(kw in text_lower for kw in TRIGGER_KEYWORDS)
+    if not any(kw in text_lower for kw in TRIGGER_KEYWORDS):
+        return "אין מילות מפתח רלוונטיות"
+
+    return "pass"
 
 
 # ──────────────────────────────────────────────
@@ -651,8 +673,9 @@ def process_single_email(mail_conn, email_data: dict) -> bool:
         return False
 
     # סינון מהיר לפני AI
-    if not quick_keyword_filter(full_text):
-        log(f"⏭️ דילוג - אין מילות מפתח: {subject[:50]}")
+    filter_result = quick_keyword_filter(full_text)
+    if filter_result != "pass":
+        log(f"⏭️ דילוג - {filter_result}: {subject[:50]}")
         mark_seen(mail_conn, uid)
         return False
 
